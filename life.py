@@ -88,7 +88,17 @@ def prepare_rule_weights(
     )
 
 
-def _build_activation(
+def preactivation(
+    x: torch.Tensor,
+    birth_score: torch.Tensor,
+    survival_score: torch.Tensor,
+    *,
+    bias: float = 0.5,
+) -> torch.Tensor:
+    return (1.0 - x) * birth_score + x * survival_score - bias
+
+
+def build_activation(
     alpha: float, hard: bool
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     if hard:
@@ -142,13 +152,13 @@ def life_step_smooth(
     survival_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
-    Differentiable, single-threshold update that reduces to B3/S23 in the hard limit.
+    Differentiable, single-threshold update that reduces to Birth:3/Survive:2-3 in the hard limit.
 
     A preactivation is formed from the neighbor sum s and current state x,
     then a single nonlinearity produces the next state. This avoids explicit
     boolean equality tests on s.
 
-    pre_activation = (1 - x) * birth_score(s) + x * survive_score(s) - 0.5
+    preactivation = (1 - x) * birth_score(s) + x * survive_score(s) - 0.5
     next_state = sigmoid(alpha * z)  # or hard: y = (z > 0)
 
     Args:
@@ -167,7 +177,7 @@ def life_step_smooth(
         raise ValueError("State must have exactly 2 dimensions (H, W).")
     batched_state = _reshape_to_bchw(state)
     kernel = _KERNEL
-    activation = _build_activation(alpha, hard)
+    activation = build_activation(alpha, hard)
     rule_birth, rule_survival = prepare_rule_weights(
         birth_weights,
         survival_weights,
@@ -178,14 +188,11 @@ def life_step_smooth(
     neighbor_sums = convolve_neighbors(batched_state, kernel, wrap)
     basis = gaussian_neighbor_basis(neighbor_sums, sigma)
 
-    birth_score = (basis * rule_birth).sum(dim=-1)  # (..., H, W)
-    survival_score = (basis * rule_survival).sum(dim=-1)  # (..., H, W)
+    birth_score = (basis * rule_birth).sum(dim=-1)
+    survival_score = (basis * rule_survival).sum(dim=-1)
 
-    pre_activation = (
-        1.0 - batched_state
-    ) * birth_score + batched_state * survival_score
-    pre_activation -= 0.5
+    z = preactivation(batched_state, birth_score, survival_score, bias=0.5)
 
-    next_state = activation(pre_activation)
+    next_state = activation(z)
 
     return _restore_shape(next_state)
