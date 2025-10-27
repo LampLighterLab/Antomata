@@ -1,3 +1,5 @@
+from typing import Callable
+
 import torch
 import torch.nn.functional as F
 
@@ -6,6 +8,85 @@ import torch.nn.functional as F
 _KERNEL = torch.tensor([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=torch.float32).view(
     1, 1, 3, 3
 )
+
+
+def _to_float32(state: torch.Tensor) -> torch.Tensor:
+    if state.dtype != torch.float32:
+        return state.to(dtype=torch.float32)
+    return state
+
+
+def _reshape_to_bchw(state: torch.Tensor) -> torch.Tensor:
+    """
+    torch.conv2d requires an input of shape 4, with B, C, H, W.
+    B (batch): how many separate grids/images you process in parallel.
+    C (channels): per-cell feature planes. A standard Life board has one channel (alive/dead).
+    H, W: height and width.
+    """
+    state_float = _to_float32(state)
+    if state_float.dim() != 2:
+        raise ValueError("State must have exactly 2 dimensions (H, W).")
+    return state_float.unsqueeze(0).unsqueeze(0)
+
+
+def _restore_shape(state_bchw: torch.Tensor) -> torch.Tensor:
+    return state_bchw.squeeze(0).squeeze(0)
+
+
+def convolve_neighbors(batched_state: torch.Tensor, kernel, wrap: bool) -> torch.Tensor:
+    kernel = kernel.to(batched_state.device)
+    if wrap:
+        padded = F.pad(batched_state, (1, 1, 1, 1), mode="circular")
+        return F.conv2d(padded, kernel, padding=0)
+    return F.conv2d(batched_state, kernel, padding=1)
+
+
+def gaussian_neighbor_basis(neighbor_sums: torch.Tensor, sigma: float) -> torch.Tensor:
+    centers = torch.arange(0, 9, device=neighbor_sums.device, dtype=neighbor_sums.dtype)
+    centers = centers.view(1, 1, 1, 1, 9)
+    return torch.exp(-0.5 * ((neighbor_sums.unsqueeze(-1) - centers) / sigma) ** 2)
+
+
+def prepare_rule_weights(
+    birth_weights: torch.Tensor | None,
+    survival_weights: torch.Tensor | None,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if birth_weights is None:
+        prepared_birth = torch.zeros(9, device=device, dtype=dtype)
+        prepared_birth[3] = 1.0
+    else:
+        prepared_birth = birth_weights.to(device=device, dtype=dtype)
+
+    if survival_weights is None:
+        prepared_survival = torch.zeros(9, device=device, dtype=dtype)
+        prepared_survival[2] = 1.0
+        prepared_survival[3] = 1.0
+    else:
+        prepared_survival = survival_weights.to(device=device, dtype=dtype)
+
+    return (
+        prepared_birth.view(1, 1, 1, 1, 9),
+        prepared_survival.view(1, 1, 1, 1, 9),
+    )
+
+
+def _build_activation(
+    alpha: float, hard: bool
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    if hard:
+
+        def hard_activation(values: torch.Tensor) -> torch.Tensor:
+            return (values > 0).to(values.dtype)
+
+        return hard_activation
+
+    def smooth_activation(values: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(alpha * values)
+
+    return smooth_activation
 
 
 def life_step(state: torch.Tensor, wrap: bool = True) -> torch.Tensor:
@@ -19,39 +100,20 @@ def life_step(state: torch.Tensor, wrap: bool = True) -> torch.Tensor:
     Returns:
         Tensor with the same shape as the input containing the next state.
     """
-    if state.dtype != torch.float32:
-        state = state.to(dtype=torch.float32)
+    kernel = _KERNEL
+    if state.dim() != 2:
+        raise ValueError("State must have exactly 2 dimensions (H, W).")
 
-    if state.dim() < 2:
-        raise ValueError("State must have at least 2 dimensions (H, W).")
+    batch_state = _reshape_to_bchw(state)
 
-    # Ensure the tensor has shape (B, C, H, W) for conv2d.
-    if state.dim() == 2:
-        batch_state = state.unsqueeze(0).unsqueeze(0)
-    elif state.dim() == 3:
-        batch_state = state.unsqueeze(1)
-    else:
-        # Assume already (B, C, H, W)
-        batch_state = state
-
-    device_kernel = _KERNEL.to(batch_state.device)
-    if wrap:
-        padded = F.pad(batch_state, (1, 1, 1, 1), mode="circular")
-        neighbor_counts = F.conv2d(padded, device_kernel, padding=0)
-    else:
-        neighbor_counts = F.conv2d(batch_state, device_kernel, padding=1)
+    neighbor_counts = convolve_neighbors(batch_state, kernel, wrap)
 
     alive = batch_state > 0.5
     next_state = ((neighbor_counts == 3) | (alive & (neighbor_counts == 2))).to(
         batch_state.dtype
     )
 
-    # Squeeze back to the original rank.
-    if state.dim() == 2:
-        return next_state.squeeze(0).squeeze(0)
-    if state.dim() == 3:
-        return next_state.squeeze(1)
-    return next_state
+    return _restore_shape(next_state)
 
 
 def life_step_smooth(
@@ -61,18 +123,18 @@ def life_step_smooth(
     sigma: float = 0.20,
     wrap: bool = True,
     hard: bool = False,
-    w_birth: torch.Tensor | None = None,
-    w_survive: torch.Tensor | None = None,
+    birth_weights: torch.Tensor | None = None,
+    survival_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Differentiable, single-threshold update that reduces to B3/S23 in the hard limit.
 
-    A preactivation z(s, x) is formed from the neighbor sum s and current state x,
+    A preactivation is formed from the neighbor sum s and current state x,
     then a single nonlinearity produces the next state. This avoids explicit
     boolean equality tests on s.
 
-    z = (1 - x) * birth_score(s) + x * survive_score(s) - 0.5
-    y = sigmoid(alpha * z)  # or hard: y = (z > 0)
+    pre_activation = (1 - x) * birth_score(s) + x * survive_score(s) - 0.5
+    next_state = sigmoid(alpha * z)  # or hard: y = (z > 0)
 
     Args:
         state: Tensor of shape (..., H, W) or (..., 1, H, W) with values in [0, 1].
@@ -80,56 +142,35 @@ def life_step_smooth(
         sigma: Width of the Gaussian basis centered at integer neighbor counts.
         wrap: Use circular padding (toroidal surface) if True, else zero padding.
         hard: If True, return a binary 0/1 next state using (z > 0).
-        w_birth: Optional length-9 weights for birth score over counts 0..8.
-        w_survive: Optional length-9 weights for survive score over counts 0..8.
+        birth_weights: Optional length-9 weights for birth score over counts 0..8.
+        survival_weights: Optional length-9 weights for survival score over counts 0..8.
 
     Returns:
-        Tensor with same shape as input; float in [0,1] unless hard=True.
+        Tensor with same shape as the input; float in [0, 1] unless hard=True.
     """
-    x = state.to(dtype=torch.float32)
+    if state.dim() != 2:
+        raise ValueError("State must have exactly 2 dimensions (H, W).")
+    batched_state = _reshape_to_bchw(state)
+    kernel = _KERNEL
+    activation = _build_activation(alpha, hard)
+    rule_birth, rule_survival = prepare_rule_weights(
+        birth_weights,
+        survival_weights,
+        device=batched_state.device,
+        dtype=batched_state.dtype,
+    )
 
-    # Ensure BCHW shape for convolution
-    if x.dim() == 2:
-        x_bchw = x.unsqueeze(0).unsqueeze(0)
-    elif x.dim() == 3:
-        x_bchw = x.unsqueeze(1)
-    else:
-        x_bchw = x
+    neighbor_sums = convolve_neighbors(batched_state, kernel, wrap)
+    basis = gaussian_neighbor_basis(neighbor_sums, sigma)
 
-    device_kernel = _KERNEL.to(x_bchw.device)
-    if wrap:
-        s = F.conv2d(
-            F.pad(x_bchw, (1, 1, 1, 1), mode="circular"), device_kernel, padding=0
-        )
-    else:
-        s = F.conv2d(x_bchw, device_kernel, padding=1)
+    birth_score = (basis * rule_birth).sum(dim=-1)  # (..., H, W)
+    survival_score = (basis * rule_survival).sum(dim=-1)  # (..., H, W)
 
-    # Gaussian basis centered on integer counts 0..8
-    centers = torch.arange(0, 9, device=s.device, dtype=s.dtype).view(1, 1, 1, 1, 9)
-    phi = torch.exp(-0.5 * ((s.unsqueeze(-1) - centers) / sigma) ** 2)  # (..., 9)
+    pre_activation = (
+        1.0 - batched_state
+    ) * birth_score + batched_state * survival_score
+    pre_activation -= 0.5
 
-    # Default to B3/S23 if weights not provided
-    if w_birth is None:
-        w_birth = torch.zeros(9, device=s.device, dtype=s.dtype)
-        w_birth[3] = 1.0
-    if w_survive is None:
-        w_survive = torch.zeros(9, device=s.device, dtype=s.dtype)
-        w_survive[2] = 1.0
-        w_survive[3] = 1.0
+    next_state = activation(pre_activation)
 
-    w_birth = w_birth.view(1, 1, 1, 1, 9)
-    w_survive = w_survive.view(1, 1, 1, 1, 9)
-    birth_score = (phi * w_birth).sum(dim=-1)  # (..., H, W)
-    survive_score = (phi * w_survive).sum(dim=-1)  # (..., H, W)
-
-    z = (1.0 - x_bchw) * birth_score + x_bchw * survive_score
-    z = z - 0.5
-
-    y = torch.sigmoid(alpha * z) if not hard else (z > 0).to(z.dtype)
-
-    # Return to original rank
-    if state.dim() == 2:
-        return y.squeeze(0).squeeze(0)
-    if state.dim() == 3:
-        return y.squeeze(1)
-    return y
+    return _restore_shape(next_state)
