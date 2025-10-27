@@ -3,7 +3,7 @@ from time import sleep
 import torch
 
 from config import get_active_config
-from life import life_step, life_step_smooth
+from life import grid_from_coords, life_step, life_step_smooth
 
 
 def render_binary(state: torch.Tensor) -> str:
@@ -44,12 +44,8 @@ def main():
     alpha = float(smooth_cfg.get("alpha", 8.0))
     sigma = float(smooth_cfg.get("sigma", 0.20))
 
-    grid = torch.zeros((size, size), dtype=torch.float32, device=device)
-
-    # Simple glider pattern.
     glider = [(1, 2), (2, 3), (3, 1), (3, 2), (3, 3)]
-    for y, x in glider:
-        grid[y, x] = 1.0
+    grid = grid_from_coords(glider, size=size, device=device)
 
     state = grid
     display_soft = use_smooth and not hard

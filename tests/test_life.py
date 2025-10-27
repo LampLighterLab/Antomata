@@ -1,13 +1,7 @@
+
 import torch
 
-from life import life_step, life_step_smooth
-
-
-def grid_from_coords(coords: list[tuple[int, int]], size: int) -> torch.Tensor:
-    grid = torch.zeros((size, size), dtype=torch.float32)
-    for y, x in coords:
-        grid[y, x] = 1.0
-    return grid
+from life import grid_from_coords, life_step, life_step_smooth
 
 
 def test_smooth_mode_parameter_showcase():

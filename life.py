@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from typing import Callable
 
 import torch
@@ -8,6 +9,20 @@ import torch.nn.functional as F
 _KERNEL = torch.tensor([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=torch.float32).view(
     1, 1, 3, 3
 )
+
+
+def grid_from_coords(
+    coords: Iterable[tuple[int, int]],
+    *,
+    size: int,
+    device: torch.device | None = None,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Build a Life grid with 1.0 values at provided (row, column) coordinates."""
+    grid = torch.zeros((size, size), dtype=dtype, device=device)
+    for y, x in coords:
+        grid[y, x] = 1.0
+    return grid
 
 
 def _to_float32(state: torch.Tensor) -> torch.Tensor:
