@@ -52,9 +52,13 @@ def convolve_neighbors(batched_state: torch.Tensor, kernel, wrap: bool) -> torch
     kernel = kernel.to(batched_state.device)
     if wrap:
         padded = F.pad(batched_state, (1, 1, 1, 1), mode="circular")
-        return F.conv2d(padded, kernel, padding=0)
-    return F.conv2d(batched_state, kernel, padding=1)
-
+        neighbor_counts = F.conv2d(padded, kernel, padding = 0)
+    else:
+        neighbor_counts = F.conv2d(batched_state, kernel, padding=1)
+        alive_mas = (batched_state > 0.5).to(neighbor_counts.dtype)
+        neighbor_counts = neighbor_counts * alive_mas
+        return neighbor_counts
+    
 
 def gaussian_neighbor_basis(neighbor_sums: torch.Tensor, sigma: float) -> torch.Tensor:
     centers = torch.arange(0, 9, device=neighbor_sums.device, dtype=neighbor_sums.dtype)
